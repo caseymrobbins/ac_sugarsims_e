@@ -91,6 +91,9 @@ class Agent:
     x: int
     y: int
     resource: float
+    money: float
+    goods: float
+    goods_quality: float
     metabolism: float
     vision: int
     memory_size: int = 25
@@ -101,14 +104,30 @@ class Agent:
     preference: Dict[str, float] = field(default_factory=dict)
     spatial_memory: Dict[Coord, float] = field(default_factory=dict)
     outcome_memory: deque = field(default_factory=lambda: deque(maxlen=25))
+    trust: Dict[str, float] = field(default_factory=dict)
+    knowledge: float = 0.5
+    debt: float = 0.0
+    objective_lambda: float = field(default_factory=lambda: random.uniform(0.35, 0.85))
+    campaign_bias: float = field(default_factory=lambda: random.uniform(-0.15, 0.15))
 
     def __post_init__(self) -> None:
         if not self.preference:
             self.preference = {
                 "resource": random.uniform(0.3, 0.9),
+                "money": random.uniform(0.2, 0.8),
+                "goods": random.uniform(0.2, 0.8),
+                "quality": random.uniform(0.2, 0.8),
                 "risk": random.uniform(0.2, 0.8),
                 "social": random.uniform(0.1, 0.6),
                 "horizon": random.uniform(0.2, 0.8),
+            }
+        if not self.trust:
+            self.trust = {
+                "neighbors": random.uniform(0.2, 0.9),
+                "news": random.uniform(0.1, 0.9),
+                "leader": random.uniform(0.1, 0.9),
+                "bank": random.uniform(0.2, 0.9),
+                "market": random.uniform(0.2, 0.9),
             }
         self._normalize_preferences()
 
@@ -119,6 +138,10 @@ class Agent:
     def _normalize_preferences(self) -> None:
         for k in list(self.preference.keys()):
             self.preference[k] = clamp(self.preference[k], 0.0, 1.0)
+        for k in list(self.trust.keys()):
+            self.trust[k] = clamp(self.trust[k], 0.0, 1.0)
+        self.knowledge = clamp(self.knowledge, 0.0, 1.0)
+        self.objective_lambda = clamp(self.objective_lambda, 0.0, 1.0)
 
     def _visible_cells(self, env: Environment) -> List[Coord]:
         cells = []
@@ -149,8 +172,12 @@ class Agent:
             certainty = self._certainty(c, env)
             risk = d / max(1, self.vision) + 0.8 * crowd_penalty
 
+            quality_estimate = (self.goods_quality + 0.1 * self.knowledge) * (0.8 + 0.2 * self.trust["market"])
             u_growth = (
                 self.preference["resource"] * gain
+                + self.preference["money"] * self.money
+                + self.preference["goods"] * self.goods
+                + self.preference["quality"] * quality_estimate
                 + self.preference["risk"] * novelty
                 + self.preference["social"] * (1.0 - crowd_penalty)
                 + self.preference["horizon"] * (gain / (1 + d))
@@ -165,13 +192,37 @@ class Agent:
         self.last_mode = "growth" if random.random() < lambda_growth else "survival"
         return best
 
+    def objective_value(self, lambda_switch: float, eps: float = 1e-6) -> float:
+        vital_min = min(self.resource, self.money, self.goods, self.goods_quality)
+        if vital_min <= 0:
+            needs_utility = -1e12
+        else:
+            needs_utility = math.log(vital_min)
+        sum_logs = (
+            math.log(self.resource + eps)
+            + math.log(self.money + eps)
+            + math.log(self.goods + eps)
+            + math.log(self.goods_quality + eps)
+        )
+        return lambda_switch * needs_utility + (1.0 - lambda_switch) * sum_logs
+
+    def survival_check(self) -> None:
+        if self.resource <= 0 or self.money <= -15.0 or self.goods <= 0:
+            self.alive = False
+
     def apply_learning(self, reward: float, pressure: float) -> None:
         stress_scale = max(0.15, 1.0 - pressure)
         lr = self.learning_rate * stress_scale
         self.preference["resource"] += lr * reward
+        self.preference["money"] += lr * (0.4 * reward - 0.15 * pressure)
+        self.preference["goods"] += lr * (0.35 * reward)
+        self.preference["quality"] += lr * (0.3 * reward + 0.1 * self.knowledge)
         self.preference["risk"] += lr * (0.5 * reward - pressure * 0.3)
         self.preference["social"] += lr * (0.2 * reward)
         self.preference["horizon"] += lr * (reward - pressure * 0.4)
+        self.trust["bank"] += lr * (0.05 - pressure * 0.08)
+        self.trust["market"] += lr * (0.03 + reward * 0.06)
+        self.knowledge += lr * (0.1 + 0.3 * self.trust["news"])
 
         if pressure > 0.6:
             self.preference["risk"] *= 0.85
@@ -187,7 +238,15 @@ class Agent:
 
         before = self.resource
         self.resource += harvested
+        self.money += harvested * (0.06 + 0.12 * self.trust["market"])
+        self.goods += harvested * (0.03 + 0.06 * self.preference["goods"])
+        self.goods_quality = clamp(
+            0.95 * self.goods_quality + 0.05 * (0.5 * self.knowledge + 0.5 * self.trust["news"]),
+            0.01,
+            3.0,
+        )
         self.resource -= self.metabolism + move_cost
+        self.goods = max(0.0, self.goods - 0.25 * self.metabolism)
         reward = (self.resource - before) / max(1.0, before)
 
         self.outcome_memory.append((new_coord, reward))
@@ -202,9 +261,101 @@ class Agent:
             if self.spatial_memory[c] < 0.05:
                 del self.spatial_memory[c]
 
-        self.apply_learning(reward, pressure)
-        if self.resource <= 0:
-            self.alive = False
+        self.apply_learning(reward + 0.08 * self.objective_value(self.objective_lambda), pressure)
+        self.survival_check()
+
+
+@dataclass
+class Loan:
+    borrower_id: int
+    principal: float
+    interest_rate: float
+    term_remaining: int
+
+
+@dataclass
+class Bank:
+    reserves: float = 500.0
+    loans: List[Loan] = field(default_factory=list)
+
+    def maybe_issue_loan(self, agent: Agent) -> None:
+        credit_score = 0.5 * agent.trust["bank"] + 0.5 * agent.knowledge - 0.03 * max(0.0, agent.debt)
+        if credit_score > 0.45 and agent.money < 5.0 and self.reserves > 10.0:
+            principal = min(12.0, self.reserves * 0.05)
+            self.reserves -= principal
+            agent.money += principal
+            agent.debt += principal
+            self.loans.append(Loan(agent.agent_id, principal, interest_rate=0.025, term_remaining=12))
+
+    def process_loans(self, agents_by_id: Dict[int, Agent]) -> None:
+        survivors: List[Loan] = []
+        for loan in self.loans:
+            borrower = agents_by_id.get(loan.borrower_id)
+            if borrower is None or not borrower.alive:
+                continue
+            due = (loan.principal * (1.0 + loan.interest_rate)) / max(1, loan.term_remaining)
+            paid = min(due, max(0.0, borrower.money))
+            borrower.money -= paid
+            borrower.debt = max(0.0, borrower.debt - paid)
+            self.reserves += paid
+            loan.term_remaining -= 1
+            if loan.term_remaining > 0 and borrower.debt > 0:
+                survivors.append(loan)
+        self.loans = survivors
+
+
+@dataclass
+class Market:
+    base_price: float = 1.0
+    quality_premium: float = 0.35
+
+    def trade(self, agent: Agent) -> None:
+        if not agent.alive:
+            return
+        price = self.base_price + self.quality_premium * agent.goods_quality
+        trade_qty = min(agent.goods, 0.5 + 0.5 * agent.trust["market"])
+        revenue = trade_qty * price
+        agent.goods -= trade_qty
+        agent.money += revenue
+        buy_back = min(agent.money / max(0.3, price), 0.35 * (1.0 - agent.trust["market"]))
+        agent.money -= buy_back * price
+        agent.goods += buy_back
+
+
+@dataclass
+class LeaderCandidate:
+    name: str
+    objective_style: str
+    campaign_cycle: int = 40
+    platform_weight: float = 1.0
+
+    def objective(self, values: Sequence[float], lambda_switch: float, eps: float = 1e-6) -> float:
+        if self.objective_style == "sum":
+            return sum(values)
+        if self.objective_style == "sum_log":
+            return sum(math.log(v + eps) for v in values)
+        vital_min = min(values)
+        needs = math.log(vital_min) if vital_min > 0 else -1e12
+        sum_logs = sum(math.log(v + eps) for v in values)
+        return lambda_switch * needs + (1.0 - lambda_switch) * sum_logs
+
+
+@dataclass
+class Firm:
+    name: str
+    objective_style: str
+    cash: float = 100.0
+    investor_ids: List[int] = field(default_factory=list)
+    is_news_outlet: bool = False
+
+    def objective(self, shareholders: float, employees: float, environment: float, company: float, eps: float = 1e-6) -> float:
+        if self.objective_style == "sum":
+            return shareholders + employees + environment + company
+        vital = min(shareholders, employees, environment, company)
+        return math.log(vital) if vital > 0 else math.log(eps)
+
+    def publish_signal(self) -> float:
+        return clamp(0.35 + 0.4 * random.random() + 0.15 * (1 if self.is_news_outlet else 0), 0.0, 1.0)
 
 
 @dataclass
@@ -227,6 +378,8 @@ class SimulationConfig:
     intervention_quantile: float = 0.1
     shock_step: Optional[int] = None
     shock_severity: float = 0.5
+    election_interval: int = 20
+    campaign_interval: int = 40
     seed: int = 42
 
 
@@ -236,9 +389,23 @@ class Simulation:
         random.seed(cfg.seed)
         self.env = Environment(cfg.width, cfg.height, cfg.max_capacity, cfg.regen_rate)
         self.agents: List[Agent] = []
+        self.bank = Bank()
+        self.market = Market()
+        self.candidates = [
+            LeaderCandidate("Candidate Sum", "sum"),
+            LeaderCandidate("Candidate SumLog", "sum_log"),
+            LeaderCandidate("Candidate NeedsSwitch", "logmin_switch"),
+        ]
+        self.current_leader: LeaderCandidate = self.candidates[0]
+        self.firms: List[Firm] = [
+            Firm("Goods Cooperative", "sum"),
+            Firm("Stakeholder Trust", "logmin"),
+            Firm("Civic News", "sum", is_news_outlet=True),
+        ]
         self.time = 0
         self.history: Dict[str, List[float]] = {
-            "floor": [], "avg": [], "gini": [], "lambda": [], "alive": [], "growth_ratio": [], "survival_ratio": []
+            "floor": [], "avg": [], "gini": [], "lambda": [], "alive": [], "growth_ratio": [], "survival_ratio": [],
+            "avg_money": [], "avg_goods": [], "avg_trust_news": [], "avg_trust_leader": []
         }
         self._spawn_agents()
 
@@ -250,6 +417,9 @@ class Simulation:
                     x=random.randrange(self.cfg.width),
                     y=random.randrange(self.cfg.height),
                     resource=random.uniform(*self.cfg.initial_resource),
+                    money=random.uniform(4.0, 18.0),
+                    goods=random.uniform(2.0, 9.0),
+                    goods_quality=random.uniform(0.3, 1.2),
                     metabolism=random.uniform(*self.cfg.metabolism_range),
                     vision=random.randint(*self.cfg.vision_range),
                 )
@@ -271,8 +441,92 @@ class Simulation:
             if a.resource <= cutoff:
                 a.resource += self.cfg.intervention_amount
 
+    def _word_of_mouth_update(self, alive: List[Agent]) -> None:
+        by_coord = {a.coord: a for a in alive}
+        for agent in alive:
+            neighbors = []
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                c = ((agent.x + dx) % self.cfg.width, (agent.y + dy) % self.cfg.height)
+                other = by_coord.get(c)
+                if other is not None:
+                    neighbors.append(other)
+            if not neighbors:
+                continue
+            social_pull = mean([n.trust["leader"] for n in neighbors])
+            market_pull = mean([n.trust["market"] for n in neighbors])
+            agent.trust["leader"] = clamp(
+                0.9 * agent.trust["leader"] + 0.1 * (agent.trust["neighbors"] * social_pull), 0.0, 1.0
+            )
+            agent.trust["market"] = clamp(
+                0.9 * agent.trust["market"] + 0.1 * (agent.trust["neighbors"] * market_pull), 0.0, 1.0
+            )
+
+    def _run_news_cycle(self, alive: List[Agent]) -> None:
+        news_outlets = [f for f in self.firms if f.is_news_outlet]
+        if not news_outlets or not alive:
+            return
+        signal = mean([n.publish_signal() for n in news_outlets])
+        for agent in alive:
+            trust_news = agent.trust["news"]
+            trust_leader = agent.trust["leader"]
+            agent.knowledge = clamp(agent.knowledge + 0.04 * trust_news * signal, 0.0, 1.0)
+            agent.trust["leader"] = clamp(trust_leader + 0.03 * trust_news * (signal - 0.5), 0.0, 1.0)
+
+    def _campaign_cycle(self, alive: List[Agent], lambda_switch: float) -> None:
+        if self.time % self.cfg.campaign_interval != 0:
+            return
+        for c in self.candidates:
+            scores = []
+            for a in alive:
+                basket = [a.resource, a.money, a.goods, a.goods_quality]
+                scores.append(c.objective(basket, lambda_switch))
+            c.platform_weight = 0.6 * c.platform_weight + 0.4 * (mean(scores) if scores else 0.0)
+
+    def _election_cycle(self, alive: List[Agent], lambda_switch: float) -> None:
+        if self.time % self.cfg.election_interval != 0 or not alive:
+            return
+        votes = {c.name: 0.0 for c in self.candidates}
+        for a in alive:
+            utilities = []
+            basket = [a.resource, a.money, a.goods, a.goods_quality]
+            for c in self.candidates:
+                score = c.objective(basket, lambda_switch) + a.campaign_bias + 0.2 * c.platform_weight
+                score *= 0.5 + 0.5 * a.trust["leader"]
+                utilities.append((score, c.name))
+            winner = max(utilities, key=lambda x: x[0])[1]
+            votes[winner] += 1.0 + 0.1 * a.knowledge
+        lead_name = max(votes.items(), key=lambda kv: kv[1])[0]
+        self.current_leader = next(c for c in self.candidates if c.name == lead_name)
+        for a in alive:
+            a.trust["leader"] = clamp(a.trust["leader"] + 0.02, 0.0, 1.0)
+
+    def _firm_cycle(self, alive: List[Agent]) -> None:
+        if not alive:
+            return
+        env_score = mean([self.env.sugar[y][x] / max(1e-6, self.cfg.max_capacity) for y in range(self.cfg.height) for x in range(self.cfg.width)])
+        for firm in self.firms:
+            if not firm.investor_ids:
+                firm.investor_ids = random.sample([a.agent_id for a in alive], k=min(8, len(alive)))
+            shareholders = mean([alive[i % len(alive)].money for i in range(len(firm.investor_ids))]) if firm.investor_ids else 1.0
+            employees = mean([a.resource for a in alive])
+            company = firm.cash
+            firm_score = firm.objective(shareholders + 1e-6, employees + 1e-6, env_score + 1e-6, company + 1e-6)
+            firm.cash += 0.25 * firm_score
+            for aid in firm.investor_ids[: min(4, len(firm.investor_ids))]:
+                for agent in alive:
+                    if agent.agent_id == aid:
+                        dividend = max(0.0, 0.015 * firm.cash)
+                        agent.money += dividend
+                        firm.cash -= dividend
+                        break
+
     def step(self) -> None:
         self.time += 1
+        alive = self._alive_agents()
+        if not alive:
+            return
+        for a in alive:
+            a.survival_check()
         alive = self._alive_agents()
         if not alive:
             return
@@ -290,21 +544,38 @@ class Simulation:
         growth_count = 0
         survival_count = 0
         for a in alive:
+            self.bank.maybe_issue_loan(a)
+            self.market.trade(a)
             a.step(self.env, chosen[a.agent_id], pressure)
             if a.last_mode == "growth":
                 growth_count += 1
             else:
                 survival_count += 1
+        alive = self._alive_agents()
+        self.bank.process_loans({a.agent_id: a for a in alive})
+        self._firm_cycle(alive)
+        self._run_news_cycle(alive)
+        self._word_of_mouth_update(alive)
+        self._campaign_cycle(alive, lam)
+        self._election_cycle(alive, lam)
 
         self.env.regenerate()
         alive2 = self._alive_agents()
         resources = [a.resource for a in alive2]
+        monies = [a.money for a in alive2]
+        goods = [a.goods for a in alive2]
+        trust_news = [a.trust["news"] for a in alive2]
+        trust_leader = [a.trust["leader"] for a in alive2]
 
         self.history["floor"].append(min(resources) if resources else 0.0)
         self.history["avg"].append(mean(resources))
         self.history["gini"].append(gini(resources))
         self.history["lambda"].append(lam)
         self.history["alive"].append(float(len(alive2)))
+        self.history["avg_money"].append(mean(monies))
+        self.history["avg_goods"].append(mean(goods))
+        self.history["avg_trust_news"].append(mean(trust_news))
+        self.history["avg_trust_leader"].append(mean(trust_leader))
         total = max(1, growth_count + survival_count)
         self.history["growth_ratio"].append(growth_count / total)
         self.history["survival_ratio"].append(survival_count / total)
@@ -319,13 +590,15 @@ class Simulation:
 
 def write_csv(histories: Dict[str, Dict[str, List[float]]], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    header = "experiment,timestep,floor,avg,gini,lambda,alive,growth_ratio,survival_ratio\n"
+    header = "experiment,timestep,floor,avg,gini,lambda,alive,growth_ratio,survival_ratio,avg_money,avg_goods,avg_trust_news,avg_trust_leader\n"
     lines = [header]
     for name, h in histories.items():
         n = len(h["floor"])
         for t in range(n):
             lines.append(
-                f"{name},{t},{h['floor'][t]:.6f},{h['avg'][t]:.6f},{h['gini'][t]:.6f},{h['lambda'][t]:.6f},{h['alive'][t]:.0f},{h['growth_ratio'][t]:.6f},{h['survival_ratio'][t]:.6f}\n"
+                f"{name},{t},{h['floor'][t]:.6f},{h['avg'][t]:.6f},{h['gini'][t]:.6f},{h['lambda'][t]:.6f},"
+                f"{h['alive'][t]:.0f},{h['growth_ratio'][t]:.6f},{h['survival_ratio'][t]:.6f},{h['avg_money'][t]:.6f},"
+                f"{h['avg_goods'][t]:.6f},{h['avg_trust_news'][t]:.6f},{h['avg_trust_leader'][t]:.6f}\n"
             )
     (out_dir / "metrics.csv").write_text("".join(lines))
 
@@ -383,7 +656,8 @@ def summarize(name: str, history: Dict[str, List[float]]) -> str:
     i = -1
     return (
         f"{name}: alive_end={history['alive'][i]:.0f}, floor_end={history['floor'][i]:.2f}, avg_end={history['avg'][i]:.2f}, "
-        f"gini_end={history['gini'][i]:.2f}, growth_ratio_end={history['growth_ratio'][i]:.2f}, lambda_end={history['lambda'][i]:.2f}"
+        f"gini_end={history['gini'][i]:.2f}, growth_ratio_end={history['growth_ratio'][i]:.2f}, lambda_end={history['lambda'][i]:.2f}, "
+        f"money_end={history['avg_money'][i]:.2f}, goods_end={history['avg_goods'][i]:.2f}"
     )
 
 
