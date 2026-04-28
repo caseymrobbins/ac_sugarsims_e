@@ -20,6 +20,10 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def safe_log(value: float, eps: float = 1e-6) -> float:
+    return math.log(max(value, eps))
+
+
 def mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -198,11 +202,16 @@ class Agent:
             needs_utility = -1e12
         else:
             needs_utility = math.log(vital_min)
+
+        resource_term = self.resource + eps
+        money_term = self.money + eps
+        goods_term = self.goods + eps
+        quality_term = self.goods_quality + eps
         sum_logs = (
-            math.log(self.resource + eps)
-            + math.log(self.money + eps)
-            + math.log(self.goods + eps)
-            + math.log(self.goods_quality + eps)
+            safe_log(resource_term, eps)
+            + safe_log(money_term, eps)
+            + safe_log(goods_term, eps)
+            + safe_log(quality_term, eps)
         )
         return lambda_switch * needs_utility + (1.0 - lambda_switch) * sum_logs
 
@@ -333,10 +342,10 @@ class LeaderCandidate:
         if self.objective_style == "sum":
             return sum(values)
         if self.objective_style == "sum_log":
-            return sum(math.log(v + eps) for v in values)
+            return sum(safe_log(v + eps, eps) for v in values)
         vital_min = min(values)
         needs = math.log(vital_min) if vital_min > 0 else -1e12
-        sum_logs = sum(math.log(v + eps) for v in values)
+        sum_logs = sum(safe_log(v + eps, eps) for v in values)
         return lambda_switch * needs + (1.0 - lambda_switch) * sum_logs
 
 
@@ -352,7 +361,7 @@ class Firm:
         if self.objective_style == "sum":
             return shareholders + employees + environment + company
         vital = min(shareholders, employees, environment, company)
-        return math.log(vital) if vital > 0 else math.log(eps)
+        return safe_log(vital, eps)
 
     def publish_signal(self) -> float:
         return clamp(0.35 + 0.4 * random.random() + 0.15 * (1 if self.is_news_outlet else 0), 0.0, 1.0)
