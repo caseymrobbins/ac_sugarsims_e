@@ -409,6 +409,17 @@ class Simulation:
         }
         self._spawn_agents()
 
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "time": self.time,
+            "sugar": [[v for v in row] for row in self.env.sugar],
+            "agents": [
+                {"x": a.x, "y": a.y, "resource": a.resource, "alive": a.alive}
+                for a in self.agents
+                if a.alive
+            ],
+        }
+
     def _spawn_agents(self) -> None:
         for i in range(self.cfg.n_agents):
             self.agents.append(
@@ -587,6 +598,16 @@ class Simulation:
             self.step()
         return self.history
 
+    def run_with_snapshots(self, every: int = 1) -> Tuple[Dict[str, List[float]], List[Dict[str, object]]]:
+        frames: List[Dict[str, object]] = [self.snapshot()]
+        for _ in range(self.cfg.steps):
+            if not self._alive_agents():
+                break
+            self.step()
+            if self.time % max(1, every) == 0:
+                frames.append(self.snapshot())
+        return self.history, frames
+
 
 def write_csv(histories: Dict[str, Dict[str, List[float]]], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -659,6 +680,58 @@ def summarize(name: str, history: Dict[str, List[float]]) -> str:
         f"gini_end={history['gini'][i]:.2f}, growth_ratio_end={history['growth_ratio'][i]:.2f}, lambda_end={history['lambda'][i]:.2f}, "
         f"money_end={history['avg_money'][i]:.2f}, goods_end={history['avg_goods'][i]:.2f}"
     )
+
+
+def animate_snapshots(
+    snapshots: List[Dict[str, object]],
+    output_path: Path,
+    title: str = "Sugarscape simulation",
+    fps: int = 10,
+) -> bool:
+    if not snapshots:
+        return False
+    has_matplotlib = importlib.util.find_spec("matplotlib") is not None
+    if not has_matplotlib:
+        return False
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    sugar0 = snapshots[0]["sugar"]
+    height = len(sugar0)
+    width = len(sugar0[0]) if sugar0 else 0
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    fig.suptitle(title)
+    image = ax.imshow(sugar0, cmap="YlOrBr", vmin=0.0, vmax=max(max(row) for row in sugar0))
+    scat = ax.scatter([], [], s=14, c="cyan", edgecolors="black", linewidths=0.2)
+    txt = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", color="white", fontsize=10, bbox={"facecolor": "black", "alpha": 0.35})
+    ax.set_xlim(-0.5, width - 0.5)
+    ax.set_ylim(height - 0.5, -0.5)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    def update(i: int):
+        frame = snapshots[i]
+        sugar = frame["sugar"]
+        image.set_data(sugar)
+        alive_agents = frame["agents"]
+        points = [[a["x"], a["y"]] for a in alive_agents]
+        scat.set_offsets(points if points else [])
+        txt.set_text(f"t={frame['time']}  alive={len(alive_agents)}")
+        return image, scat, txt
+
+    anim = FuncAnimation(fig, update, frames=len(snapshots), interval=1000 / max(1, fps), blit=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ext = output_path.suffix.lower()
+    if ext == ".gif":
+        anim.save(output_path, writer="pillow", fps=fps)
+    else:
+        try:
+            anim.save(output_path, writer="ffmpeg", fps=fps)
+        except Exception:
+            fallback = output_path.with_suffix(".gif")
+            anim.save(fallback, writer="pillow", fps=fps)
+    plt.close(fig)
+    return True
 
 
 def run_experiments(args: argparse.Namespace) -> Dict[str, Dict[str, List[float]]]:
