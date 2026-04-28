@@ -198,11 +198,16 @@ class Agent:
             needs_utility = -1e12
         else:
             needs_utility = math.log(vital_min)
+
+        resource_term = max(self.resource + eps, eps)
+        money_term = max(self.money + eps, eps)
+        goods_term = max(self.goods + eps, eps)
+        quality_term = max(self.goods_quality + eps, eps)
         sum_logs = (
-            math.log(self.resource + eps)
-            + math.log(self.money + eps)
-            + math.log(self.goods + eps)
-            + math.log(self.goods_quality + eps)
+            math.log(resource_term)
+            + math.log(money_term)
+            + math.log(goods_term)
+            + math.log(quality_term)
         )
         return lambda_switch * needs_utility + (1.0 - lambda_switch) * sum_logs
 
