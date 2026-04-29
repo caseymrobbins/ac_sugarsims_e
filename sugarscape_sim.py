@@ -102,6 +102,7 @@ class Agent:
     vision: int
     memory_size: int = 25
     learning_rate: float = 0.08
+    harvest_multiplier: float = 8.0
 
     alive: bool = True
     last_mode: str = "growth"
@@ -243,7 +244,7 @@ class Agent:
             return
         move_cost = 0.05 * toroidal_distance(self.coord, new_coord, env.width, env.height)
         self.x, self.y = new_coord
-        harvested = env.harvest(self.coord)
+        harvested = min(env.harvest(self.coord), self.harvest_multiplier * self.metabolism)
 
         before = self.resource
         self.resource += harvested
@@ -373,7 +374,8 @@ class SimulationConfig:
     height: int = 30
     n_agents: int = 80
     steps: int = 250
-    max_capacity: float = 8.0
+    max_capacity: Optional[float] = None
+    square_capacity_multiplier: float = 64.0
     regen_rate: float = 0.9
     initial_resource: Tuple[float, float] = (8.0, 14.0)
     metabolism_range: Tuple[float, float] = (0.7, 1.4)
@@ -394,6 +396,8 @@ class SimulationConfig:
 
 class Simulation:
     def __init__(self, cfg: SimulationConfig):
+        if cfg.max_capacity is None:
+            cfg.max_capacity = cfg.square_capacity_multiplier * cfg.metabolism_range[1]
         self.cfg = cfg
         random.seed(cfg.seed)
         self.env = Environment(cfg.width, cfg.height, cfg.max_capacity, cfg.regen_rate)
@@ -442,6 +446,7 @@ class Simulation:
                     goods_quality=random.uniform(0.3, 1.2),
                     metabolism=random.uniform(*self.cfg.metabolism_range),
                     vision=random.randint(*self.cfg.vision_range),
+                    harvest_multiplier=8.0,
                 )
             )
 
